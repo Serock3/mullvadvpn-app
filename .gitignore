@@ -1,4 +1,5 @@
 /target/
+/benchmarks/target/
 /build/
 /dist
 /test/dist

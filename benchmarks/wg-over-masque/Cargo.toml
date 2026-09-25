@@ -1,0 +1,17 @@
+[package]
+name = "wg-over-masque-benchmark"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[package.metadata.benchy]
+id = "wg-over-masque"
+default = true
+
+[dependencies]
+anyhow.workspace = true
+benchy-lib.workspace = true
+benchy-runner.workspace = true
+masque-common = { path = "../masque-common" }
+tokio.workspace = true

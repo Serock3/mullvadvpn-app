@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+  "masque-common",
+  "masque-fragmentation",
+  "masque-throughput",
+  "wg-over-masque",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "GPL-3.0-or-later"
+
+[workspace.dependencies]
+anyhow = "1.0"
+benchy-lib = { path = "../../benchy/benchy-lib" }
+benchy-runner = { path = "../../benchy/benchy-runner" }
+serde = "1.0"
+serde_json = "1.0"
+tokio = { version = "1.44", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

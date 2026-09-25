@@ -1,0 +1,20 @@
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      benchmarks:
+        description: Comma or space-delimited benchmark IDs, or "default"/"all"
+        required: false
+        default: default
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    uses: Serock3/benchy/.github/workflows/run-benchmarks.yml@main
+    with:
+      benchmarks: ${{ inputs.benchmarks || 'default' }}
+      manifest-path: benchmarks/Cargo.toml
