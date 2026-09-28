@@ -13,16 +13,16 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use benchy_lib::Unit;
 use benchy_runner::{
     BenchmarkDefinition, MachineLock, MeasurementDefinition, Recorder, checked_output,
     default_output_path,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, Lines},
     net::TcpStream,
-    process::{Child, ChildStdout, Command},
+    process::{Child, Command},
     time::{sleep, timeout},
 };
 
@@ -72,7 +72,10 @@ pub async fn run_udp_benchmark(
     recorder.parameter("datagram_length", datagram_length);
     recorder.parameter("masque_mtu", config.masque_mtu);
 
-    match udp_controller(&config, datagram_length).await {
+    match udp_controller(&config, datagram_length)
+        .await
+        .and_then(validate_udp_result)
+    {
         Ok(result) => {
             if let Some(sent) = result.end.sent() {
                 recorder.measurement(SENDER_THROUGHPUT, sent.bits_per_second)?;
@@ -93,6 +96,14 @@ pub async fn run_udp_benchmark(
             Err(error)
         }
     }
+}
+
+fn validate_udp_result(result: iperf_udp::UdpOutput) -> Result<iperf_udp::UdpOutput> {
+    ensure!(
+        result.end.received().is_some(),
+        "iperf3 UDP output did not contain a receiver summary"
+    );
+    Ok(result)
 }
 
 async fn udp_controller(config: &Config, datagram_length: u16) -> Result<iperf_udp::UdpOutput> {
@@ -118,7 +129,7 @@ async fn udp_run(config: &Config, datagram_length: u16) -> Result<iperf_udp::Udp
             &config.peer,
             "socat",
             &[
-                format!("TCP4-LISTEN:{}", config.masque_client_port),
+                format!("TCP4-LISTEN:{},fork,reuseaddr", config.masque_client_port),
                 format!("TCP:{}:{}", config.alice_address, config.iperf_port),
             ],
             None,
@@ -209,9 +220,12 @@ impl MasqueProxies {
     pub async fn start(config: &Config, target_addr: SocketAddr) -> Result<Self> {
         let examples = build_masque_examples().await?;
         let remote_dir = scratch_dir_name();
-        deploy_client(&config.peer, &examples.client, &examples.cert, &remote_dir).await?;
+        if let Err(error) = deploy_client(&config.peer, &examples.client, &remote_dir).await {
+            remove_remote_dir(&config.peer, &remote_dir).await;
+            return Err(error);
+        }
 
-        let server = LocalProcess::spawn(
+        let mut server = match LocalProcess::spawn(
             &examples.server,
             &[
                 "--cert-path".to_owned(),
@@ -223,17 +237,22 @@ impl MasqueProxies {
             ],
             Some(READY_MARKER),
         )
-        .await?;
+        .await
+        {
+            Ok(server) => server,
+            Err(error) => {
+                remove_remote_dir(&config.peer, &remote_dir).await;
+                return Err(error);
+            }
+        };
 
         let remote_client = format!("{remote_dir}/masque-client");
-        let mut client = RemoteProcess::spawn(
+        let client = RemoteProcess::spawn(
             &config.peer,
             &remote_client,
             &[
                 "--server-addr".to_owned(),
                 config.masque_server_bind().to_string(),
-                "--root-cert-path".to_owned(),
-                format!("{remote_dir}/test.crt"),
                 "--server-hostname".to_owned(),
                 "example.org".to_owned(),
                 "--bind-addr".to_owned(),
@@ -245,12 +264,25 @@ impl MasqueProxies {
             ],
             Some(READY_MARKER),
         )
-        .await?;
+        .await;
+        let mut client = match client {
+            Ok(client) => client,
+            Err(error) => {
+                server.stop().await;
+                remove_remote_dir(&config.peer, &remote_dir).await;
+                return Err(error);
+            }
+        };
 
         // The client connects immediately after reporting readiness; a failed connection
         // exits the process right away.
         sleep(Duration::from_millis(500)).await;
-        client.check_alive().await?;
+        if let Err(error) = client.check_alive().await {
+            client.stop().await;
+            server.stop().await;
+            remove_remote_dir(&config.peer, &remote_dir).await;
+            return Err(error);
+        }
 
         Ok(Self {
             peer: config.peer.clone(),
@@ -263,14 +295,7 @@ impl MasqueProxies {
     pub async fn stop(&mut self) {
         self.client.stop().await;
         self.server.stop().await;
-        let _ = checked_output(
-            "ssh",
-            [
-                self.peer.as_str(),
-                &format!("rm -rf {}", shell_quote(&self.remote_dir)),
-            ],
-        )
-        .await;
+        remove_remote_dir(&self.peer, &self.remote_dir).await;
     }
 }
 
@@ -317,10 +342,16 @@ async fn build_masque_examples() -> Result<MasqueExamples> {
     })
 }
 
-async fn deploy_client(peer: &str, client: &Path, cert: &Path, remote_dir: &str) -> Result<()> {
+async fn deploy_client(peer: &str, client: &Path, remote_dir: &str) -> Result<()> {
     checked_output(
         "ssh",
-        [peer, &format!("mkdir -p {}", shell_quote(remote_dir))],
+        [
+            peer,
+            &format!(
+                "mkdir -p {dir} && chmod 700 {dir}",
+                dir = shell_quote(remote_dir)
+            ),
+        ],
     )
     .await?;
     checked_output(
@@ -331,17 +362,17 @@ async fn deploy_client(peer: &str, client: &Path, cert: &Path, remote_dir: &str)
         ],
     )
     .await?;
-    checked_output(
-        "scp",
-        [
-            cert.as_os_str(),
-            std::ffi::OsStr::new(&format!("{peer}:{remote_dir}/test.crt")),
-        ],
-    )
-    .await?;
     let remote_executable = shell_quote(&format!("{remote_dir}/masque-client"));
     checked_output("ssh", [peer, &format!("chmod 755 {remote_executable}")]).await?;
     Ok(())
+}
+
+async fn remove_remote_dir(peer: &str, remote_dir: &str) {
+    let _ = checked_output(
+        "ssh",
+        [peer, &format!("rm -rf -- {}", shell_quote(remote_dir))],
+    )
+    .await;
 }
 
 /// Starts an iperf3 server bound to the given address.
@@ -366,8 +397,8 @@ pub struct LocalProcess {
 }
 
 impl LocalProcess {
-    /// Spawns a process and optionally waits for a readiness marker on its stdout. The
-    /// remaining stdout is drained in the background to keep the pipe from filling up.
+    /// Spawns a process and optionally waits for a readiness marker in its stderr logs.
+    /// Output pipes are drained in the background to keep them from filling up.
     pub async fn spawn(
         program: impl AsRef<Path>,
         args: &[String],
@@ -377,7 +408,11 @@ impl LocalProcess {
         let mut child = Command::new(program)
             .args(args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(if ready_marker.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            })
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("failed to start {}", program.display()))?;
@@ -385,13 +420,19 @@ impl LocalProcess {
             .stdout
             .take()
             .context("local process stdout was not captured")?;
-        let mut lines = BufReader::new(stdout).lines();
+        let lines = BufReader::new(stdout).lines();
+        drain_remaining(lines, &program.to_string_lossy());
         if let Some(marker) = ready_marker {
+            let stderr = child
+                .stderr
+                .take()
+                .context("local process stderr was not captured")?;
+            let mut lines = BufReader::new(stderr).lines();
             wait_for_marker_lines(&mut lines, marker, &program.to_string_lossy())
                 .await
                 .with_context(|| format!("{} failed to start", program.display()))?;
+            drain_remaining(lines, &program.to_string_lossy());
         }
-        drain_remaining(lines, &program.to_string_lossy());
         Ok(Self { child })
     }
 
@@ -411,7 +452,7 @@ pub struct RemoteProcess {
 impl RemoteProcess {
     /// Runs `sh -c 'echo $$; exec program args'` on the peer and records the reported
     /// process ID so the process can be stopped later. When `ready_marker` is given,
-    /// waits for it on the process stdout.
+    /// waits for it in the process stderr logs.
     pub async fn spawn(
         peer: &str,
         program: &str,
@@ -424,7 +465,11 @@ impl RemoteProcess {
             .arg(peer)
             .arg(remote)
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(if ready_marker.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            })
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("failed to start {program} on the peer"))?;
@@ -447,18 +492,29 @@ impl RemoteProcess {
         .await
         .context("timed out waiting for the remote process ID")??;
 
-        if let Some(marker) = ready_marker {
-            wait_for_marker_lines(&mut lines, marker, program)
-                .await
-                .with_context(|| format!("{program} on the peer failed to start"))?;
-        }
         drain_remaining(lines, program);
-
-        Ok(Self {
+        let mut process = Self {
             peer: peer.to_owned(),
             pid,
             child,
-        })
+        };
+
+        if let Some(marker) = ready_marker {
+            let stderr = process
+                .child
+                .stderr
+                .take()
+                .context("remote process stderr was not captured")?;
+            let mut lines = BufReader::new(stderr).lines();
+            if let Err(error) = wait_for_marker_lines(&mut lines, marker, program).await {
+                process.stop().await;
+                return Err(error)
+                    .with_context(|| format!("{program} on the peer failed to start"));
+            }
+            drain_remaining(lines, program);
+        }
+
+        Ok(process)
     }
 
     pub async fn check_alive(&mut self) -> Result<()> {
@@ -535,7 +591,7 @@ pub async fn wait_for_tunnel(peer: &str, destination: Ipv4Addr) -> Result<()> {
 pub async fn remote_write_file(peer: &str, path: &str, contents: &str) -> Result<()> {
     let mut child = Command::new("ssh")
         .arg(peer)
-        .arg(format!("cat > {}", shell_quote(path)))
+        .arg(format!("umask 077; cat > {}", shell_quote(path)))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -597,27 +653,21 @@ pub mod iperf_udp {
     impl UdpEnd {
         /// The sender-side summary, if the test reported one.
         pub fn sent(&self) -> Option<&UdpSummary> {
-            if self
-                .sum
-                .as_ref()
-                .is_some_and(|summary| summary.sender == Some(true))
-            {
-                return self.sum.as_ref();
-            }
-            self.sum_sent.as_ref()
+            self.sum_sent.as_ref().or_else(|| {
+                self.sum
+                    .as_ref()
+                    .filter(|summary| summary.sender == Some(true))
+            })
         }
 
         /// The receiver-side summary, if the test reported one. This is the side that
         /// carries jitter and loss statistics.
         pub fn received(&self) -> Option<&UdpSummary> {
-            if self
-                .sum
-                .as_ref()
-                .is_some_and(|summary| summary.sender != Some(true))
-            {
-                return self.sum.as_ref();
-            }
-            self.sum_received.as_ref()
+            self.sum_received.as_ref().or_else(|| {
+                self.sum
+                    .as_ref()
+                    .filter(|summary| summary.sender == Some(false))
+            })
         }
     }
 
@@ -635,8 +685,8 @@ pub mod iperf_udp {
     }
 }
 
-async fn wait_for_marker_lines(
-    lines: &mut Lines<BufReader<ChildStdout>>,
+async fn wait_for_marker_lines<R: AsyncRead + Unpin>(
+    lines: &mut Lines<BufReader<R>>,
     marker: &str,
     name: &str,
 ) -> Result<()> {
@@ -659,7 +709,7 @@ async fn wait_for_marker_lines(
     .context("timed out waiting for process readiness")?
 }
 
-fn drain_remaining(lines: Lines<BufReader<ChildStdout>>, name: &str) {
+fn drain_remaining<R: AsyncRead + Unpin + Send + 'static>(lines: Lines<BufReader<R>>, name: &str) {
     let name = name.to_owned();
     tokio::spawn(async move {
         let mut lines = lines;
@@ -705,7 +755,22 @@ pub fn init_logging() {
 
 #[cfg(test)]
 mod tests {
-    use super::{iperf_udp, remote_command, shell_quote};
+    use super::{LocalProcess, iperf_udp, remote_command, shell_quote, validate_udp_result};
+
+    #[tokio::test]
+    async fn local_readiness_is_detected_on_stderr() {
+        let mut process = LocalProcess::spawn(
+            "sh",
+            &[
+                "-c".to_owned(),
+                "echo 'Listening on test' >&2; exec sleep 10".to_owned(),
+            ],
+            Some("Listening on"),
+        )
+        .await
+        .unwrap();
+        process.stop().await;
+    }
 
     #[test]
     fn shell_arguments_are_single_quoted() {
@@ -766,5 +831,28 @@ mod tests {
         let received = output.end.received().unwrap();
         assert_eq!(received.bits_per_second, 810_000_000.0);
         assert_eq!(received.lost_percent, Some(1.0));
+    }
+
+    #[test]
+    fn udp_iperf_output_prefers_explicit_summaries() {
+        let output: iperf_udp::UdpOutput = serde_json::from_value(serde_json::json!({
+            "end": {
+                "sum": { "bits_per_second": 1.0, "sender": false },
+                "sum_sent": { "bits_per_second": 2.0, "sender": true },
+                "sum_received": { "bits_per_second": 3.0, "sender": false }
+            }
+        }))
+        .unwrap();
+        assert_eq!(output.end.sent().unwrap().bits_per_second, 2.0);
+        assert_eq!(output.end.received().unwrap().bits_per_second, 3.0);
+    }
+
+    #[test]
+    fn udp_iperf_output_requires_receiver_summary() {
+        let output: iperf_udp::UdpOutput = serde_json::from_value(serde_json::json!({
+            "end": { "sum": { "bits_per_second": 1.0 } }
+        }))
+        .unwrap();
+        assert!(validate_udp_result(output).is_err());
     }
 }

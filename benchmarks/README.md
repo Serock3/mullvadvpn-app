@@ -26,9 +26,9 @@ All benchmarks run on the controller host and drive the peer over SSH, mirroring
 GotaTun throughput benchmark in the `gotatun` repository. The proxies under test are
 built from this checkout with `cargo build --release --locked -p mullvad-masque-proxy
 --example masque-server --example masque-client` and the client is deployed to the peer
-from there. The TLS material is the self-signed example certificate that ships with the
-proxy; the client pins it via `--root-cert-path` and connects with the hostname
-`example.org`.
+from there. The server uses the self-signed example certificate that ships with the
+proxy. The current example client does not verify the server certificate; this setup
+is suitable only for the isolated benchmark link.
 
 ## Measurements
 
@@ -60,4 +60,6 @@ needs `iperf3`, `socat`, `bash`, `wg`, and the same passwordless sudo operations
 
 iperf3's TCP control channel cannot traverse the UDP-only proxy, so the UDP benchmarks
 relay it directly to the server with `socat` on the peer. WireGuard key material is
-generated for each run with `wg genkey`/`wg genpsk` and is not stored anywhere.
+generated for each run with `wg genkey`/`wg genpsk`. The temporary local config has
+mode `0600` and is deleted after it is applied; the remote config is written inside a
+mode `0700` scratch directory and removed during benchmark cleanup.

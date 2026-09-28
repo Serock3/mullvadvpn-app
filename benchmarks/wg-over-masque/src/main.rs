@@ -1,6 +1,12 @@
 use std::{
+    env,
+    fs::{self, OpenOptions},
+    io::Write as _,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    os::unix::fs::OpenOptionsExt as _,
+    path::PathBuf,
     process::Stdio,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -13,7 +19,7 @@ use masque_common::{
     Config, MasqueProxies, iperf_server, remote_command, remote_write_file, scratch_dir_name,
     wait_for_tunnel, wait_local_tcp,
 };
-use tokio::{fs, io::AsyncWriteExt, process::Command};
+use tokio::{io::AsyncWriteExt, process::Command};
 
 const DEFINITION: BenchmarkDefinition = BenchmarkDefinition {
     repository: "mullvadvpn-app",
@@ -96,10 +102,9 @@ async fn controller(config: &Config) -> Result<iperf::Output> {
 }
 
 async fn tunnel_run(config: &Config) -> Result<iperf::Output> {
+    let keys = WireguardKeys::generate().await?;
+    let mut tunnel = setup_wireguard(config, &keys).await?;
     let result = async {
-        let keys = WireguardKeys::generate().await?;
-        setup_wireguard(config, &keys).await?;
-
         let mut iperf = iperf_server(IpAddr::from(ALICE_TUNNEL_ADDRESS), config.iperf_port).await?;
         let result = async {
             wait_for_tunnel(&config.peer, ALICE_TUNNEL_ADDRESS).await?;
@@ -130,7 +135,7 @@ async fn tunnel_run(config: &Config) -> Result<iperf::Output> {
     }
     .await;
 
-    teardown_wireguard(config).await;
+    tunnel.stop().await;
     result
 }
 
@@ -212,9 +217,80 @@ async fn wg_key(args: &[&str], stdin_data: &str) -> Result<String> {
         .map(|key| key.trim().to_owned())
 }
 
-async fn setup_wireguard(config: &Config, keys: &WireguardKeys) -> Result<()> {
+struct WireguardTunnel {
+    peer: String,
+    interface: String,
+    alice_created: bool,
+    bob_created: bool,
+}
+
+impl WireguardTunnel {
+    async fn stop(&mut self) {
+        if self.bob_created {
+            let _ = sudo_remote(&self.peer, &["ip", "link", "del", &self.interface]).await;
+            self.bob_created = false;
+        }
+        if self.alice_created {
+            let _ = sudo(&["ip", "link", "del", &self.interface]).await;
+            self.alice_created = false;
+        }
+    }
+}
+
+struct PrivateConfigFile(PathBuf);
+
+impl PrivateConfigFile {
+    fn new(contents: &str) -> Result<Self> {
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path =
+            env::temp_dir().join(format!("benchy-wg-{}-{timestamp}.conf", std::process::id()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .context("failed to create private WireGuard config")?;
+        let config = Self(path);
+        file.write_all(contents.as_bytes())
+            .context("failed to write private WireGuard config")?;
+        Ok(config)
+    }
+
+    fn path(&self) -> Result<&str> {
+        self.0
+            .to_str()
+            .context("WireGuard config path is not valid UTF-8")
+    }
+}
+
+impl Drop for PrivateConfigFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+async fn setup_wireguard(config: &Config, keys: &WireguardKeys) -> Result<WireguardTunnel> {
+    let mut tunnel = WireguardTunnel {
+        peer: config.peer.clone(),
+        interface: config.interface.clone(),
+        alice_created: false,
+        bob_created: false,
+    };
+    if let Err(error) = configure_wireguard(config, keys, &mut tunnel).await {
+        tunnel.stop().await;
+        return Err(error);
+    }
+    Ok(tunnel)
+}
+
+async fn configure_wireguard(
+    config: &Config,
+    keys: &WireguardKeys,
+    tunnel: &mut WireguardTunnel,
+) -> Result<()> {
     let interface = config.interface.as_str();
     sudo(&["ip", "link", "add", interface, "type", "wireguard"]).await?;
+    tunnel.alice_created = true;
     sudo(&[
         "ip",
         "address",
@@ -236,12 +312,11 @@ async fn setup_wireguard(config: &Config, keys: &WireguardKeys) -> Result<()> {
     ])
     .await?;
 
-    let scratch = scratch_dir_name();
-    fs::create_dir_all(&scratch).await?;
-    let alice_conf = format!("{scratch}/wg-alice.conf");
-    fs::write(&alice_conf, keys.alice_config(config)).await?;
-    sudo(&["wg", "setconf", interface, &alice_conf]).await?;
+    let alice_conf = PrivateConfigFile::new(&keys.alice_config(config))?;
+    sudo(&["wg", "setconf", interface, alice_conf.path()?]).await?;
+    drop(alice_conf);
 
+    let scratch = scratch_dir_name();
     let remote_conf = format!("{scratch}/wg-bob.conf");
     remote_write_file(&config.peer, &remote_conf, &keys.bob_config(config)).await?;
 
@@ -250,6 +325,7 @@ async fn setup_wireguard(config: &Config, keys: &WireguardKeys) -> Result<()> {
         &["ip", "link", "add", interface, "type", "wireguard"],
     )
     .await?;
+    tunnel.bob_created = true;
     sudo_remote(
         &config.peer,
         &[
@@ -280,12 +356,6 @@ async fn setup_wireguard(config: &Config, keys: &WireguardKeys) -> Result<()> {
     Ok(())
 }
 
-async fn teardown_wireguard(config: &Config) {
-    let interface = config.interface.as_str();
-    let _ = sudo(&["ip", "link", "del", interface]).await;
-    let _ = sudo_remote(&config.peer, &["ip", "link", "del", interface]).await;
-}
-
 fn tunnel_address(address: Ipv4Addr) -> String {
     format!("{address}/24")
 }
@@ -307,4 +377,26 @@ async fn sudo_remote(peer: &str, args: &[&str]) -> Result<()> {
         .await
         .with_context(|| format!("failed to run sudo {} on the peer", args.join(" ")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt as _, path::PathBuf};
+
+    use super::PrivateConfigFile;
+
+    #[test]
+    fn private_config_is_restricted_and_removed() {
+        let path: PathBuf;
+        {
+            let config = PrivateConfigFile::new("private key").unwrap();
+            path = PathBuf::from(config.path().unwrap());
+            assert_eq!(fs::read_to_string(&path).unwrap(), "private key");
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(!path.exists());
+    }
 }
