@@ -14,15 +14,16 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use benchy_lib::Unit;
+use benchy_lib::{Unit, iperf::UdpOutput};
 use benchy_runner::{
     BenchmarkDefinition, MachineLock, MeasurementDefinition, Recorder, checked_output,
-    default_output_path,
+    default_output_path, parse_iperf_udp_output,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, Lines},
     net::TcpStream,
     process::{Child, Command},
+    sync::mpsc,
     time::{sleep, timeout},
 };
 
@@ -98,7 +99,7 @@ pub async fn run_udp_benchmark(
     }
 }
 
-fn validate_udp_result(result: iperf_udp::UdpOutput) -> Result<iperf_udp::UdpOutput> {
+fn validate_udp_result(result: UdpOutput) -> Result<UdpOutput> {
     ensure!(
         result.end.received().is_some(),
         "iperf3 UDP output did not contain a receiver summary"
@@ -106,7 +107,7 @@ fn validate_udp_result(result: iperf_udp::UdpOutput) -> Result<iperf_udp::UdpOut
     Ok(result)
 }
 
-async fn udp_controller(config: &Config, datagram_length: u16) -> Result<iperf_udp::UdpOutput> {
+async fn udp_controller(config: &Config, datagram_length: u16) -> Result<UdpOutput> {
     let _machine_lock = MachineLock::acquire("/tmp/benchy.lock")?;
 
     // The MASQUE client forwards UDP datagrams to the iperf3 server on Alice.
@@ -120,7 +121,7 @@ async fn udp_controller(config: &Config, datagram_length: u16) -> Result<iperf_u
     result
 }
 
-async fn udp_run(config: &Config, datagram_length: u16) -> Result<iperf_udp::UdpOutput> {
+async fn udp_run(config: &Config, datagram_length: u16) -> Result<UdpOutput> {
     let mut iperf_server = iperf_server(config.alice_address, config.iperf_port).await?;
     let result = async {
         // The MASQUE proxy only forwards UDP, so iperf3's TCP control channel is
@@ -156,7 +157,7 @@ async fn udp_run(config: &Config, datagram_length: u16) -> Result<iperf_udp::Udp
                 ],
             );
             let output = checked_output("ssh", [&config.peer, &iperf_command]).await?;
-            iperf_udp::parse(&output)
+            parse_iperf_udp_output(output).await
         }
         .await;
         socat.stop().await;
@@ -397,8 +398,9 @@ pub struct LocalProcess {
 }
 
 impl LocalProcess {
-    /// Spawns a process and optionally waits for a readiness marker in its stderr logs.
-    /// Output pipes are drained in the background to keep them from filling up.
+    /// Spawns a process and optionally waits for a readiness marker in its output. Both
+    /// stdout and stderr are watched, since the binary under test decides where its logs
+    /// go. The streams are drained in the background to keep the pipes from filling up.
     pub async fn spawn(
         program: impl AsRef<Path>,
         args: &[String],
@@ -420,18 +422,27 @@ impl LocalProcess {
             .stdout
             .take()
             .context("local process stdout was not captured")?;
-        let lines = BufReader::new(stdout).lines();
-        drain_remaining(lines, &program.to_string_lossy());
+        let name = program.to_string_lossy().into_owned();
+
         if let Some(marker) = ready_marker {
             let stderr = child
                 .stderr
                 .take()
                 .context("local process stderr was not captured")?;
-            let mut lines = BufReader::new(stderr).lines();
-            wait_for_marker_lines(&mut lines, marker, &program.to_string_lossy())
+            let (readiness, receiver) = mpsc::channel(2);
+            watch_output_stream(
+                BufReader::new(stdout).lines(),
+                name.clone(),
+                marker,
+                readiness.clone(),
+            );
+            watch_output_stream(BufReader::new(stderr).lines(), name, marker, readiness);
+            timeout(READY_TIMEOUT, wait_for_readiness(receiver))
                 .await
+                .context("timed out waiting for process readiness")?
                 .with_context(|| format!("{} failed to start", program.display()))?;
-            drain_remaining(lines, &program.to_string_lossy());
+        } else {
+            drain_remaining(BufReader::new(stdout).lines(), &name);
         }
         Ok(Self { child })
     }
@@ -452,7 +463,7 @@ pub struct RemoteProcess {
 impl RemoteProcess {
     /// Runs `sh -c 'echo $$; exec program args'` on the peer and records the reported
     /// process ID so the process can be stopped later. When `ready_marker` is given,
-    /// waits for it in the process stderr logs.
+    /// waits for it in the process output on both streams.
     pub async fn spawn(
         peer: &str,
         program: &str,
@@ -492,7 +503,6 @@ impl RemoteProcess {
         .await
         .context("timed out waiting for the remote process ID")??;
 
-        drain_remaining(lines, program);
         let mut process = Self {
             peer: peer.to_owned(),
             pid,
@@ -505,12 +515,23 @@ impl RemoteProcess {
                 .stderr
                 .take()
                 .context("remote process stderr was not captured")?;
-            let mut lines = BufReader::new(stderr).lines();
-            if let Err(error) = wait_for_marker_lines(&mut lines, marker, program).await {
+            let (readiness, receiver) = mpsc::channel(2);
+            watch_output_stream(lines, program.to_owned(), marker, readiness.clone());
+            watch_output_stream(
+                BufReader::new(stderr).lines(),
+                program.to_owned(),
+                marker,
+                readiness,
+            );
+            let ready = timeout(READY_TIMEOUT, wait_for_readiness(receiver))
+                .await
+                .context("timed out waiting for process readiness")?;
+            if let Err(error) = ready {
                 process.stop().await;
                 return Err(error)
                     .with_context(|| format!("{program} on the peer failed to start"));
             }
+        } else {
             drain_remaining(lines, program);
         }
 
@@ -614,99 +635,73 @@ pub async fn remote_write_file(peer: &str, path: &str, contents: &str) -> Result
     Ok(())
 }
 
-/// Tolerant parsing of the `end` section of iperf3 UDP JSON output.
-///
-/// Newer iperf3 versions report the sender and receiver summaries separately in
-/// `end.sum_sent` and `end.sum_received`; older versions only emit the ambiguous
-/// `end.sum`, disambiguated by its `sender` flag.
-pub mod iperf_udp {
-    use std::process::Output;
-
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct UdpOutput {
-        pub end: UdpEnd,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct UdpEnd {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub sum: Option<UdpSummary>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub sum_sent: Option<UdpSummary>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub sum_received: Option<UdpSummary>,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct UdpSummary {
-        pub bits_per_second: f64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub jitter_ms: Option<f64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub lost_percent: Option<f64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub sender: Option<bool>,
-    }
-
-    impl UdpEnd {
-        /// The sender-side summary, if the test reported one.
-        pub fn sent(&self) -> Option<&UdpSummary> {
-            self.sum_sent.as_ref().or_else(|| {
-                self.sum
-                    .as_ref()
-                    .filter(|summary| summary.sender == Some(true))
-            })
-        }
-
-        /// The receiver-side summary, if the test reported one. This is the side that
-        /// carries jitter and loss statistics.
-        pub fn received(&self) -> Option<&UdpSummary> {
-            self.sum_received.as_ref().or_else(|| {
-                self.sum
-                    .as_ref()
-                    .filter(|summary| summary.sender == Some(false))
-            })
-        }
-    }
-
-    pub fn parse(output: &Output) -> anyhow::Result<UdpOutput> {
-        use anyhow::Context as _;
-        if !output.status.success() {
-            anyhow::bail!(
-                "iperf3 failed with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        serde_json::from_slice(&output.stdout)
-            .context("failed to deserialize iperf3 UDP JSON output")
-    }
-}
-
-async fn wait_for_marker_lines<R: AsyncRead + Unpin>(
-    lines: &mut Lines<BufReader<R>>,
+/// Reads a process output stream for its lifetime: logs every line, reports the
+/// readiness outcome through the channel once, and keeps draining so the pipe cannot
+/// fill up. Owning the stream in a dedicated task avoids losing partially read lines to
+/// task cancellation.
+fn watch_output_stream<R>(
+    lines: Lines<BufReader<R>>,
+    name: String,
     marker: &str,
-    name: &str,
-) -> Result<()> {
-    timeout(READY_TIMEOUT, async {
+    readiness: mpsc::Sender<Result<()>>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let marker = marker.to_owned();
+    tokio::spawn(async move {
+        let mut lines = lines;
+        let mut marker = Some(marker);
         let mut last_line = String::new();
-        while let Some(line) = lines
-            .next_line()
-            .await
-            .context("failed to read process output")?
-        {
-            if line.contains(marker) {
-                return Ok(());
+        loop {
+            let line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    if let Some(marker) = marker.take() {
+                        let _ = readiness
+                            .send(Err(anyhow::anyhow!(
+                                "output ended before the marker {marker:?} appeared; \
+                                 last output: {last_line:?}"
+                            )))
+                            .await;
+                    }
+                    return;
+                }
+                Err(error) => {
+                    if marker.take().is_some() {
+                        let _ = readiness
+                            .send(Err(error).context(format!("failed to read output of {name}")))
+                            .await;
+                    }
+                    return;
+                }
+            };
+            if marker
+                .as_ref()
+                .is_some_and(|marker| line.contains(marker.as_str()))
+            {
+                marker = None;
+                let _ = readiness.send(Ok(())).await;
             }
             tracing::info!("{name}: {line}");
             last_line = line;
         }
-        bail!("the process exited before reporting readiness; last output: {last_line:?}")
-    })
-    .await
-    .context("timed out waiting for process readiness")?
+    });
+}
+
+/// Resolves readiness when any watched stream reports the marker, or fails when all of
+/// them ended without it.
+async fn wait_for_readiness(mut readiness: mpsc::Receiver<Result<()>>) -> Result<()> {
+    let mut failures = Vec::new();
+    while let Some(outcome) = readiness.recv().await {
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(error) => failures.push(format!("{error:#}")),
+        }
+    }
+    bail!(
+        "all output streams ended before the readiness marker appeared: {}",
+        failures.join("; ")
+    )
 }
 
 fn drain_remaining<R: AsyncRead + Unpin + Send + 'static>(lines: Lines<BufReader<R>>, name: &str) {
@@ -755,7 +750,24 @@ pub fn init_logging() {
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalProcess, iperf_udp, remote_command, shell_quote, validate_udp_result};
+    use benchy_lib::iperf::UdpOutput;
+
+    use super::{LocalProcess, remote_command, shell_quote, validate_udp_result};
+
+    #[tokio::test]
+    async fn local_readiness_is_detected_on_stdout() {
+        let mut process = LocalProcess::spawn(
+            "sh",
+            &[
+                "-c".to_owned(),
+                "echo 'Listening on test'; exec sleep 10".to_owned(),
+            ],
+            Some("Listening on"),
+        )
+        .await
+        .unwrap();
+        process.stop().await;
+    }
 
     #[tokio::test]
     async fn local_readiness_is_detected_on_stderr() {
@@ -783,76 +795,28 @@ mod tests {
     }
 
     #[test]
-    fn udp_iperf_output_parses_separate_sender_and_receiver_summaries() {
-        let json = serde_json::json!({
-            "end": {
-                "sum_sent": {
-                    "bits_per_second": 900_000_000.0,
-                    "jitter_ms": 0.0,
-                    "lost_packets": 0,
-                    "packets": 7500,
-                    "lost_percent": 0.0,
-                    "sender": true
-                },
-                "sum_received": {
-                    "bits_per_second": 810_000_000.0,
-                    "jitter_ms": 0.007,
-                    "lost_packets": 75,
-                    "packets": 7425,
-                    "lost_percent": 1.0,
-                    "sender": false
-                }
-            }
-        });
-
-        let output: iperf_udp::UdpOutput = serde_json::from_value(json).unwrap();
-        assert_eq!(output.end.sent().unwrap().bits_per_second, 900_000_000.0);
-        let received = output.end.received().unwrap();
-        assert_eq!(received.bits_per_second, 810_000_000.0);
-        assert_eq!(received.lost_percent, Some(1.0));
-        assert_eq!(received.jitter_ms, Some(0.007));
-    }
-
-    #[test]
-    fn udp_iperf_output_parses_legacy_ambiguous_summary() {
-        let json = serde_json::json!({
-            "end": {
-                "sum": {
-                    "bits_per_second": 810_000_000.0,
-                    "jitter_ms": 0.007,
-                    "lost_percent": 1.0,
-                    "sender": false
-                }
-            }
-        });
-
-        let output: iperf_udp::UdpOutput = serde_json::from_value(json).unwrap();
-        assert!(output.end.sent().is_none());
-        let received = output.end.received().unwrap();
-        assert_eq!(received.bits_per_second, 810_000_000.0);
-        assert_eq!(received.lost_percent, Some(1.0));
-    }
-
-    #[test]
-    fn udp_iperf_output_prefers_explicit_summaries() {
-        let output: iperf_udp::UdpOutput = serde_json::from_value(serde_json::json!({
-            "end": {
-                "sum": { "bits_per_second": 1.0, "sender": false },
-                "sum_sent": { "bits_per_second": 2.0, "sender": true },
-                "sum_received": { "bits_per_second": 3.0, "sender": false }
-            }
-        }))
-        .unwrap();
-        assert_eq!(output.end.sent().unwrap().bits_per_second, 2.0);
-        assert_eq!(output.end.received().unwrap().bits_per_second, 3.0);
-    }
-
-    #[test]
     fn udp_iperf_output_requires_receiver_summary() {
-        let output: iperf_udp::UdpOutput = serde_json::from_value(serde_json::json!({
+        let output: UdpOutput = serde_json::from_value(serde_json::json!({
             "end": { "sum": { "bits_per_second": 1.0 } }
         }))
         .unwrap();
         assert!(validate_udp_result(output).is_err());
+    }
+
+    #[test]
+    fn udp_result_with_receiver_summary_is_accepted() {
+        let output: UdpOutput = serde_json::from_value(serde_json::json!({
+            "end": {
+                "sum_sent": { "bits_per_second": 900_000_000.0, "sender": true },
+                "sum_received": {
+                    "bits_per_second": 810_000_000.0,
+                    "jitter_ms": 0.007,
+                    "lost_percent": 1.0,
+                    "sender": false
+                }
+            }
+        }))
+        .unwrap();
+        validate_udp_result(output).unwrap();
     }
 }

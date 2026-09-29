@@ -63,3 +63,8 @@ relay it directly to the server with `socat` on the peer. WireGuard key material
 generated for each run with `wg genkey`/`wg genpsk`. The temporary local config has
 mode `0600` and is deleted after it is applied; the remote config is written inside a
 mode `0700` scratch directory and removed during benchmark cleanup.
+
+The `wg-over-masque` benchmark only removes interfaces it created itself. If a run is
+interrupted before its cleanup, a stale `bench0` interface can remain on either host and
+make the next run fail while creating the interface; remove it with
+`sudo ip link del bench0` on the affected host and run the benchmark again.

@@ -231,7 +231,6 @@ dependencies = [
  "anyhow",
  "benchy-lib",
  "benchy-runner",
- "serde",
  "serde_json",
  "tokio",
  "tracing",
